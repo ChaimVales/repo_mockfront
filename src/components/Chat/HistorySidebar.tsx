@@ -1,0 +1,168 @@
+import React, { useEffect, useState } from 'react';
+import { X, MessageSquare, Loader2 } from 'lucide-react';
+import { getHistory } from '../../api/zchatApi';
+import type { ConversationSummary } from '../../api/types';
+
+/**
+ * ============================================================
+ * HistorySidebar - סיידבר היסטוריית שיחות
+ * ============================================================
+ *
+ * רכיב **עצמאי לחלוטין** - לא תלוי באף state חיצוני חוץ מ-open + onClose.
+ * אפשר להוסיף, להסיר, או לבטל אותו בלי להשפיע על שום קוד אחר ב-ChatWindow.
+ *
+ * שימוש:
+ *   <HistorySidebar
+ *     isOpen={isHistoryOpen}
+ *     onClose={() => setIsHistoryOpen(false)}
+ *     onConversationClick={(conv) => console.log(conv)} // אופציונלי
+ *   />
+ *
+ * הסיידבר טוען את הרשימה מ-`/history` בכל פתיחה.
+ * השרת מחזיר {user_personal_number, conversations: [{session_id, summary}]}.
+ */
+
+interface HistorySidebarProps {
+    /** האם הסיידבר פתוח */
+    isOpen: boolean;
+    /** נקרא כשהמשתמש סוגר את הסיידבר (X / לחיצה מחוץ / Esc) */
+    onClose: () => void;
+    /** אופציונלי - נקרא כשהמשתמש לוחץ על שיחה מהרשימה */
+    onConversationClick?: (conversation: ConversationSummary) => void;
+}
+
+export const HistorySidebar: React.FC<HistorySidebarProps> = ({
+    isOpen,
+    onClose,
+    onConversationClick,
+}) => {
+    const [conversations, setConversations] = useState<ConversationSummary[]>([]);
+    const [userPersonalNumber, setUserPersonalNumber] = useState<string>('');
+    const [isLoading, setIsLoading] = useState<boolean>(false);
+    const [error, setError] = useState<string | null>(null);
+
+    // טעינת ההיסטוריה בכל פתיחה של הסיידבר
+    useEffect(() => {
+        if (!isOpen) return;
+        let cancelled = false;
+
+        const loadHistory = async () => {
+            setIsLoading(true);
+            setError(null);
+            try {
+                const data = await getHistory();
+                if (!cancelled) {
+                    setConversations(data.conversations);
+                    setUserPersonalNumber(data.user_personal_number);
+                }
+            } catch (err) {
+                if (!cancelled) {
+                    setError(err instanceof Error ? err.message : 'שגיאה בטעינת היסטוריה');
+                }
+            } finally {
+                if (!cancelled) setIsLoading(false);
+            }
+        };
+
+        loadHistory();
+        return () => {
+            cancelled = true;
+        };
+    }, [isOpen]);
+
+    // ESC לסגירה
+    useEffect(() => {
+        if (!isOpen) return;
+        const handleEsc = (e: KeyboardEvent) => {
+            if (e.key === 'Escape') onClose();
+        };
+        document.addEventListener('keydown', handleEsc);
+        return () => document.removeEventListener('keydown', handleEsc);
+    }, [isOpen, onClose]);
+
+    return (
+        <>
+            {/* רקע שקוף - לחיצה עליו סוגרת */}
+            <div
+                onClick={onClose}
+                className={`absolute inset-0 z-40 bg-slate-900/30 transition-opacity duration-300 ${isOpen ? 'opacity-100' : 'opacity-0 pointer-events-none'
+                    }`}
+            />
+
+            {/* הסיידבר עצמו - מחליק מימין (RTL) עם אנימציה */}
+            <aside
+                dir="rtl"
+                className={`absolute right-0 top-0 bottom-0 z-50 w-72 max-w-[85%] bg-white shadow-2xl border-l border-slate-200 flex flex-col transform transition-transform duration-300 ease-out ${isOpen ? 'translate-x-0' : 'translate-x-full'
+                    }`}
+            >
+                {/* כותרת */}
+                <div className="flex items-center justify-between px-4 py-3 border-b border-slate-200 bg-gradient-to-l from-blue-50 to-white flex-shrink-0">
+                    <div className="flex flex-col">
+                        <div className="flex items-center gap-2">
+                            <MessageSquare size={18} className="text-blue-600" />
+                            <h3 className="font-bold text-slate-800">היסטוריית שיחות</h3>
+                        </div>
+                        {userPersonalNumber && (
+                            <span className="text-[10px] text-slate-400 mt-0.5 mr-7">
+                                משתמש: {userPersonalNumber}
+                            </span>
+                        )}
+                    </div>
+                    <button
+                        onClick={onClose}
+                        className="p-1.5 hover:bg-slate-200 rounded-lg text-slate-600 transition-colors"
+                        title="סגור"
+                    >
+                        <X size={16} />
+                    </button>
+                </div>
+
+                {/* תוכן - רשימת שיחות / לואדר / שגיאה */}
+                <div className="flex-1 overflow-y-auto p-2">
+                    {isLoading && (
+                        <div className="flex items-center justify-center gap-2 py-8 text-slate-500 text-sm">
+                            <Loader2 size={16} className="animate-spin" />
+                            <span>טוען היסטוריה...</span>
+                        </div>
+                    )}
+
+                    {error && (
+                        <div className="px-3 py-4 text-xs text-red-600 bg-red-50 border border-red-200 rounded-lg">
+                            ⚠️ {error}
+                        </div>
+                    )}
+
+                    {!isLoading && !error && conversations.length === 0 && (
+                        <div className="text-center py-8 text-sm text-slate-400">
+                            אין שיחות קודמות
+                        </div>
+                    )}
+
+                    {!isLoading && !error && conversations.length > 0 && (
+                        <ul className="flex flex-col gap-1">
+                            {conversations.map((conv) => (
+                                <li key={conv.session_id}>
+                                    <button
+                                        onClick={() => onConversationClick?.(conv)}
+                                        className="w-full text-right px-3 py-2.5 rounded-lg hover:bg-blue-50 hover:text-blue-700 transition-colors flex items-start gap-2 text-sm text-slate-700 group"
+                                    >
+                                        <MessageSquare
+                                            size={14}
+                                            className="text-slate-400 group-hover:text-blue-500 mt-0.5 flex-shrink-0"
+                                        />
+                                        <div className="flex-1 min-w-0">
+                                            <div className="truncate">{conv.summary}</div>
+                                            <div className="text-[10px] text-slate-400 truncate font-mono mt-0.5">
+                                                {conv.session_id}
+                                            </div>
+                                        </div>
+                                    </button>
+                                </li>
+                            ))}
+                        </ul>
+                    )}
+                </div>
+            </aside>
+        </>
+    );
+};
