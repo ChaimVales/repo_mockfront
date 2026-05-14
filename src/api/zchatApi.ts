@@ -1,6 +1,6 @@
 import axios from 'axios';
 import { apiClient } from './client';
-import type { ChatRequest, ChatResponse, Entity, FeedbackRequest, HistoryResponse, InitRequest } from './types';
+import type { ChatRequest, ChatResponse, ConversationDetail, Entity, FeedbackRequest, HistoryResponse, InitRequest } from './types';
 
 // ============================================================
 // קונפיגורציה - שנה כאן את ה-URL וההגדרות
@@ -23,6 +23,8 @@ export type StreamEvent =
         type: 'response';
         text: string;
         session_id: string;
+        message_id?: string;             // מזהה ההודעה (חדש)
+        timestamp?: string;              // זמן השרת (ISO 8601) - חדש
         entities: Entity[];
         needs_clarification?: boolean;
         clarify_for?: string | null;
@@ -116,6 +118,8 @@ export async function sendChatMessageStream(
                         const chatResponse: ChatResponse = {
                             response: event.text,
                             session_id: event.session_id,
+                            message_id: event.message_id,        // העברת המזהה
+                            timestamp: event.timestamp,          // העברת זמן השרת
                             entities: event.entities,
                             needs_clarification: event.needs_clarification ?? false,
                             clarify_for: event.clarify_for ?? null,
@@ -159,10 +163,20 @@ export async function sendFeedback(feedback: FeedbackRequest): Promise<void> {
 
 /**
  * מקבל מהשרת אובייקט עם user_personal_number ורשימת השיחות שלו.
- * תוכן השיחה עצמה ייטען בנפרד (יתווסף בשלב הבא).
  */
 export async function getHistory(): Promise<HistoryResponse> {
     const { data } = await apiClient.get<HistoryResponse>('/history');
+    return data;
+}
+
+/**
+ * מקבל מהשרת שיחה מלאה לפי session_id (לתצוגה read-only).
+ * מחזיר את כל ההודעות בסדר כרונולוגי.
+ */
+export async function getConversation(sessionId: string): Promise<ConversationDetail> {
+    const { data } = await apiClient.get<ConversationDetail>('/history/conversation', {
+        params: { session_id: sessionId },
+    });
     return data;
 }
 

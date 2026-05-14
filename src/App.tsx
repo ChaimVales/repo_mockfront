@@ -5,14 +5,13 @@ import MapWindow from './components/Chat/MapWindow';
 
 const AppContent = () => {
   return (
-    // עוטף חיצוני - רקע מדורג עדין שעוטף את כל העמוד
+    // רקע יוקרתי - גוון בז' עדין שמרגיש פרימיום, לא טכני
     <div
-      className="h-screen w-screen overflow-hidden p-3 bg-gradient-to-br from-slate-200 via-slate-100 to-slate-200"
+      className="h-screen w-screen overflow-hidden p-4 bg-[radial-gradient(circle_at_top_left,_#f5f1ea_0%,_#ebe6da_100%)]"
       dir="rtl"
     >
-      {/* קונטיינר פנימי - עם פינות מעוגלות, צל וגבול שמנגיש את הגימור */}
-      <div className="h-full w-full rounded-2xl shadow-2xl overflow-hidden border border-slate-300 bg-white">
-        {/* Tooltip.Provider מאפשר לכל ה-Tip ברחבי האפליקציה לעבוד */}
+      {/* קונטיינר ראשי - מסגרת מסוגננת עם צל עמוק ופינות מאוד מעוגלות */}
+      <div className="h-full w-full rounded-[20px] shadow-[0_20px_60px_-15px_rgba(0,0,0,0.15),0_8px_20px_-5px_rgba(0,0,0,0.08)] overflow-hidden border border-stone-200/60 bg-white">
         <Tooltip.Provider delayDuration={300} skipDelayDuration={100}>
           <ChatWindow>
             <MapWindow />

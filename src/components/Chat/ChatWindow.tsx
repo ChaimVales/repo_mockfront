@@ -8,10 +8,12 @@ import {
 } from 'lucide-react';
 import * as Dialog from '@radix-ui/react-dialog';
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
-import { sendChatMessageStream, sendFeedback, isAbortError } from '../../api/zchatApi';
+import { sendChatMessageStream, sendFeedback, getConversation, isAbortError } from '../../api/zchatApi';
+import type { Entity } from '../../api/types';
 import { Tip } from '../ui/Tooltip';
 import { streamText } from '../../utils/streaming';
 import { exportChatAsWord } from '../../utils/chatExport';
+import { renderMessageText } from '../../utils/messageRenderer';
 import { HistorySidebar } from './HistorySidebar';
 
 // קישור קבוע לקבוצת ה-WhatsApp של פורום המשתמשים
@@ -71,6 +73,12 @@ interface Message {
      * אם < text.length - יוצג כפתור "המשך" לפתיחת עוד תווים.
      */
     visibleChars?: number;
+    /**
+     * רשימת ישויות שהוחזרו עם התשובה.
+     * משמשת ב-renderMessageText כדי להפוך שמות לחיצים בתוך הטקסט.
+     * (לעתיד: יישלחו דרך callback למפה לציור)
+     */
+    entities?: Entity[];
 }
 
 /** הודעה בתור - שומר את הזמן המדויק שהמשתמש לחץ Enter */
@@ -126,6 +134,9 @@ const ChatLayout: React.FC<ChatLayoutProps> = ({ children }) => {
     const [copiedMessageId, setCopiedMessageId] = useState<number | null>(null);
     // סיידבר ההיסטוריה (רכיב עצמאי - אפשר להסיר בקלות)
     const [isHistoryOpen, setIsHistoryOpen] = useState<boolean>(false);
+    // מצב read-only - פעיל כשצופים בשיחה מההיסטוריה (אי אפשר לכתוב/לשלוח)
+    const [viewingHistorySessionId, setViewingHistorySessionId] = useState<string | null>(null);
+    const isReadOnly = viewingHistorySessionId !== null;
     // רוחב הכותרת כדי לקבוע אם להציג כפתורים inline או בתפריט "עוד" (responsive)
     const headerRef = useRef<HTMLDivElement>(null);
     const [headerWidth, setHeaderWidth] = useState<number>(0);
@@ -173,6 +184,7 @@ const ChatLayout: React.FC<ChatLayoutProps> = ({ children }) => {
         setSessionId(null); // איפוס מזהה השיחה - בפעם הבאה יתחיל שיחה חדשה לגמרי
         setIsGenerating(false);
         setQueue([]); // ניקוי התור
+        setViewingHistorySessionId(null); // יציאה ממצב צפייה
     };
 
     // מזער: שומר את הכל בדיוק כפי שהיה - מיקום, גודל, הודעות, וטקסט בקלט
@@ -228,6 +240,57 @@ const ChatLayout: React.FC<ChatLayoutProps> = ({ children }) => {
     };
 
     /**
+     * טוען שיחה היסטורית לתצוגה (read-only).
+     * אחרי הקריאה - הצ'אט עובר למצב צפייה: לא ניתן להקליד או לשלוח.
+     */
+    const handleViewHistoricalConversation = async (sessionId: string) => {
+        // עוצרים כל סטרימינג / קריאה פעילה
+        if (abortControllerRef.current) {
+            abortControllerRef.current.abort();
+            abortControllerRef.current = null;
+        }
+        if (streamCancelRef.current) {
+            streamCancelRef.current();
+            streamCancelRef.current = null;
+        }
+        setIsGenerating(false);
+        setQueue([]);
+        setInputText('');
+
+        try {
+            const detail = await getConversation(sessionId);
+            // ממירים את ההודעות לפורמט של הצ'אט
+            const loadedMessages: Message[] = detail.messages.map((m, idx) => ({
+                id: Date.now() + idx,                       // id מקומי ייחודי לרינדור
+                sender: m.sender,
+                text: m.text,
+                timestamp: new Date(m.timestamp).getTime(),
+            }));
+            setMessages(loadedMessages);
+            setSessionId(sessionId);
+            setViewingHistorySessionId(sessionId);          // מפעיל מצב read-only
+        } catch (err) {
+            console.warn('Failed to load conversation:', err);
+            const errorMessage = err instanceof Error ? err.message : 'שגיאה';
+            setMessages([
+                {
+                    id: Date.now(),
+                    sender: 'bot',
+                    text: `⚠️ שגיאה בטעינת השיחה: ${errorMessage}`,
+                },
+            ]);
+        }
+    };
+
+    /** יציאה ממצב צפייה - מתחילים שיחה חדשה */
+    const handleExitHistoryView = () => {
+        setViewingHistorySessionId(null);
+        setMessages(INITIAL_MESSAGES);
+        setSessionId(null);
+        setInputText('');
+    };
+
+    /**
      * הרחבת הודעת בוט שמקוטעת - מוסיף עוד EXPAND_CHARS_PER_CLICK תווים לתצוגה.
      * אם זה חורג מהאורך המלא - מציג הכל.
      */
@@ -262,12 +325,20 @@ const ChatLayout: React.FC<ChatLayoutProps> = ({ children }) => {
         }
     };
 
-    /** Like - שליחה מיידית של משוב חיובי, ללא דיאלוג */
+    /**
+     * Like - מסמן משוב חיובי. ניתן ללחוץ גם אם כבר ניתן משוב שלילי - זה משנה אותו.
+     * אם כבר חיובי - לא עושים כלום (אין צורך לשלוח שוב).
+     */
     const handleLike = (messageId: number) => {
+        const msg = messages.find((m) => m.id === messageId);
+        if (msg?.feedbackGiven === 'positive') return; // כבר חיובי - אין שינוי
         submitFeedback(messageId, 'positive', null, null);
     };
 
-    /** Dislike - פתיחת דיאלוג עם רשימת סיבות */
+    /**
+     * Dislike - פותח דיאלוג עם רשימת סיבות.
+     * עובד תמיד - גם אם ההודעה כבר סומנה חיובית או שלילית (מאפשר שינוי).
+     */
     const handleDislikeClick = (messageId: number) => {
         setDislikingMessageId(messageId);
         setSelectedReason(null);
@@ -313,6 +384,7 @@ const ChatLayout: React.FC<ChatLayoutProps> = ({ children }) => {
         setInputText('');
         setSessionId(null); // התחלת שיחה חדשה - מאפסים את ה-session_id
         setQueue([]); // ניקוי התור
+        setViewingHistorySessionId(null); // יציאה ממצב צפייה
     };
 
     /**
@@ -359,10 +431,21 @@ const ChatLayout: React.FC<ChatLayoutProps> = ({ children }) => {
                     // כשהתשובה הסופית מגיעה - מתחילים את הסטרימינג של הטקסט
                     onResponse: async (response) => {
                         setSessionId(response.session_id);
-                        // מנקים את ה-currentAction - עכשיו מתחיל הטקסט עצמו
+                        // ה-timestamp של הבוט מגיע מהשרת (אם הגיע, אחרת fallback לזמן מקומי)
+                        const botTimestamp = response.timestamp
+                            ? new Date(response.timestamp).getTime()
+                            : Date.now();
+                        // מנקים currentAction + שומרים entities + timestamp של הבוט
                         setMessages((prev) =>
                             prev.map((m) =>
-                                m.id === botMsgId ? { ...m, currentAction: undefined } : m,
+                                m.id === botMsgId
+                                    ? {
+                                        ...m,
+                                        currentAction: undefined,
+                                        entities: response.entities,
+                                        timestamp: botTimestamp,
+                                    }
+                                    : m,
                             ),
                         );
 
@@ -657,39 +740,39 @@ const ChatLayout: React.FC<ChatLayoutProps> = ({ children }) => {
                 />
             )}
 
-            {/* כותרת - responsive עם ResizeObserver */}
+            {/* כותרת - יוקרתית, גוון דיוקני עם accent זהב */}
             <div
                 ref={headerRef}
-                className={`h-12 bg-slate-900 text-white flex items-center justify-between select-none border-b border-blue-400/30 flex-shrink-0 ${isUltraCompact ? 'px-1 gap-0.5' : 'px-2 gap-1'
+                className={`h-14 bg-gradient-to-l from-[#1a1f2e] via-[#0f1419] to-[#1a1f2e] text-stone-100 flex items-center justify-between select-none border-b border-amber-500/10 flex-shrink-0 shadow-[inset_0_-1px_0_rgba(245,158,11,0.08)] ${isUltraCompact ? 'px-2 gap-1' : 'px-3 gap-2'
                     }`}
             >
                 {/* צד ימין: כפתור המבורגר + לוגו Zchat - מתכווץ נכון בלי לחפוף */}
                 <div className={`flex items-center min-w-0 flex-shrink ${isUltraCompact ? 'gap-1' : 'gap-1.5'}`}>
-                    <Tip text="היסטוריית שיחות">
+                    <Tip text="ניתן לצפות בהיסטוריה של 30 שיחות בלבד">
                         <button
                             onClick={() => setIsHistoryOpen(true)}
-                            className="p-1 hover:bg-white/10 rounded transition-colors flex-shrink-0"
+                            className="p-1.5 rounded text-stone-400 hover:text-amber-300 hover:bg-white/5 transition-colors flex-shrink-0"
                         >
                             <Menu size={isUltraCompact ? 14 : 16} />
                         </button>
                     </Tip>
-                    {/* לוגו Z - קטן יותר במצב ultra compact */}
+                    {/* לוגו Z - גרדיאנט זהב יוקרתי, פונט serif מסוגנן */}
                     <div
-                        className={`bg-gradient-to-br from-blue-500 to-cyan-400 rounded-lg flex items-center justify-center font-black text-white shadow-md shadow-blue-500/40 flex-shrink-0 ${isUltraCompact ? 'w-5 h-5 text-[10px]' : 'w-7 h-7 text-sm'
+                        className={`bg-gradient-to-br from-amber-300 via-amber-500 to-amber-700 rounded-md flex items-center justify-center font-serif font-bold text-[#0f1419] shadow-[0_2px_8px_rgba(245,158,11,0.25)] flex-shrink-0 ${isUltraCompact ? 'w-6 h-6 text-xs' : 'w-8 h-8 text-base'
                             }`}
                     >
                         Z
                     </div>
                     {/* שם המותג - מוסתר במצב מצומצם מאוד */}
                     {!isVeryCompact && (
-                        <span className="font-bold text-base tracking-tight truncate min-w-0">
-                            <span className="text-blue-400">Z</span>chat
+                        <span className="font-light text-[17px] tracking-[0.04em] truncate min-w-0 text-stone-100">
+                            <span className="font-medium text-amber-400">Z</span>chat
                         </span>
                     )}
                     {/* נקודת סטטוס - מוסתרת ב-compact */}
                     {!isCompact && (
                         <div
-                            className="w-1.5 h-1.5 bg-green-500 rounded-full flex-shrink-0 shadow-[0_0_6px_rgba(34,197,94,0.7)]"
+                            className="w-1.5 h-1.5 bg-emerald-400 rounded-full flex-shrink-0 shadow-[0_0_8px_rgba(52,211,153,0.6)]"
                             title="פעיל"
                         />
                     )}
@@ -697,11 +780,11 @@ const ChatLayout: React.FC<ChatLayoutProps> = ({ children }) => {
 
                 {/* אמצע: בורר מיקום - inline רק במצב רחב */}
                 {!isCompact && !isMaximized && (
-                    <div className="flex items-center gap-0.5 bg-slate-800 rounded p-0.5 flex-shrink-0">
+                    <div className="flex items-center gap-0.5 bg-black/30 ring-1 ring-white/5 rounded-md p-0.5 flex-shrink-0">
                         <Tip text="עגן שמאל">
                             <button
                                 onClick={() => setPosition('left')}
-                                className={`p-1 rounded ${position === 'left' ? 'bg-blue-600' : 'hover:bg-white/10'}`}
+                                className={`p-1.5 rounded transition-colors ${position === 'left' ? 'bg-amber-500/20 text-amber-300 ring-1 ring-amber-400/30' : 'text-stone-400 hover:bg-white/5 hover:text-stone-200'}`}
                             >
                                 <PanelLeft size={13} />
                             </button>
@@ -709,7 +792,7 @@ const ChatLayout: React.FC<ChatLayoutProps> = ({ children }) => {
                         <Tip text="עגן ימין">
                             <button
                                 onClick={() => setPosition('right')}
-                                className={`p-1 rounded ${position === 'right' ? 'bg-blue-600' : 'hover:bg-white/10'}`}
+                                className={`p-1.5 rounded transition-colors ${position === 'right' ? 'bg-amber-500/20 text-amber-300 ring-1 ring-amber-400/30' : 'text-stone-400 hover:bg-white/5 hover:text-stone-200'}`}
                             >
                                 <PanelRight size={13} />
                             </button>
@@ -717,7 +800,7 @@ const ChatLayout: React.FC<ChatLayoutProps> = ({ children }) => {
                         <Tip text="עגן למעלה">
                             <button
                                 onClick={() => setPosition('top')}
-                                className={`p-1 rounded ${position === 'top' ? 'bg-blue-600' : 'hover:bg-white/10'}`}
+                                className={`p-1.5 rounded transition-colors ${position === 'top' ? 'bg-amber-500/20 text-amber-300 ring-1 ring-amber-400/30' : 'text-stone-400 hover:bg-white/5 hover:text-stone-200'}`}
                             >
                                 <PanelTop size={13} />
                             </button>
@@ -725,7 +808,7 @@ const ChatLayout: React.FC<ChatLayoutProps> = ({ children }) => {
                         <Tip text="עגן למטה">
                             <button
                                 onClick={() => setPosition('bottom')}
-                                className={`p-1 rounded ${position === 'bottom' ? 'bg-blue-600' : 'hover:bg-white/10'}`}
+                                className={`p-1.5 rounded transition-colors ${position === 'bottom' ? 'bg-amber-500/20 text-amber-300 ring-1 ring-amber-400/30' : 'text-stone-400 hover:bg-white/5 hover:text-stone-200'}`}
                             >
                                 <PanelBottom size={13} />
                             </button>
@@ -741,7 +824,7 @@ const ChatLayout: React.FC<ChatLayoutProps> = ({ children }) => {
                             <Tip text="מידע ועזרה">
                                 <button
                                     onClick={() => setIsInfoOpen(true)}
-                                    className="p-1 hover:bg-blue-600 rounded transition-colors"
+                                    className="p-1.5 rounded text-stone-400 hover:text-amber-300 hover:bg-white/5 transition-colors"
                                 >
                                     <HelpCircle size={15} />
                                 </button>
@@ -749,7 +832,7 @@ const ChatLayout: React.FC<ChatLayoutProps> = ({ children }) => {
                             <Tip text="צ'אט חדש">
                                 <button
                                     onClick={handleNewChat}
-                                    className="p-1 hover:bg-blue-600 rounded transition-colors"
+                                    className="p-1.5 rounded text-stone-400 hover:text-amber-300 hover:bg-white/5 transition-colors"
                                 >
                                     <Plus size={15} />
                                 </button>
@@ -758,30 +841,29 @@ const ChatLayout: React.FC<ChatLayoutProps> = ({ children }) => {
                                 <button
                                     onClick={handleExportChat}
                                     disabled={messages.length === 0}
-                                    className="p-1 hover:bg-blue-600 rounded transition-colors disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-transparent"
+                                    className="p-1.5 rounded text-stone-400 hover:text-amber-300 hover:bg-white/5 transition-colors disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:bg-transparent disabled:hover:text-stone-400"
                                 >
                                     <Download size={15} />
                                 </button>
                             </Tip>
-                            <div className="w-px h-4 bg-white/20 mx-0.5" />
+                            <div className="w-px h-5 bg-white/10 mx-1" />
                         </>
                     )}
 
                     {/* תפריט "עוד" - מופיע רק במצב compact, מכיל את הכפתורים שהוסתרו */}
                     {isCompact && (
                         <>
-                            <DropdownMenu.Root>
+                            <DropdownMenu.Root dir="rtl">
                                 <DropdownMenu.Trigger asChild>
                                     <button
                                         title="עוד פעולות"
-                                        className="p-1 hover:bg-white/10 rounded transition-colors data-[state=open]:bg-white/10 flex-shrink-0"
+                                        className="p-1.5 rounded text-stone-400 hover:text-amber-300 hover:bg-white/5 transition-colors data-[state=open]:bg-white/10 data-[state=open]:text-amber-300 flex-shrink-0"
                                     >
                                         <MoreVertical size={16} />
                                     </button>
                                 </DropdownMenu.Trigger>
                                 <DropdownMenu.Portal>
                                     <DropdownMenu.Content
-                                        dir="rtl"
                                         align="end"
                                         sideOffset={6}
                                         className="bg-white rounded-lg shadow-2xl border border-slate-200 p-1 z-[100] min-w-[200px]"
@@ -850,7 +932,7 @@ const ChatLayout: React.FC<ChatLayoutProps> = ({ children }) => {
                                     </DropdownMenu.Content>
                                 </DropdownMenu.Portal>
                             </DropdownMenu.Root>
-                            <div className="w-px h-4 bg-white/20 mx-0.5" />
+                            <div className="w-px h-5 bg-white/10 mx-1" />
                         </>
                     )}
 
@@ -858,7 +940,7 @@ const ChatLayout: React.FC<ChatLayoutProps> = ({ children }) => {
                     <Tip text="מזער (זוכר מיקום וגודל)">
                         <button
                             onClick={handleMinimize}
-                            className="p-1 hover:bg-white/10 rounded"
+                            className="p-1.5 rounded text-stone-400 hover:text-stone-100 hover:bg-white/5 transition-colors"
                         >
                             <Minus size={15} />
                         </button>
@@ -866,7 +948,7 @@ const ChatLayout: React.FC<ChatLayoutProps> = ({ children }) => {
                     <Tip text={isMaximized ? 'שחזר גודל' : 'מסך מלא'}>
                         <button
                             onClick={() => setIsMaximized(!isMaximized)}
-                            className="p-1 hover:bg-white/10 rounded"
+                            className="p-1.5 rounded text-stone-400 hover:text-stone-100 hover:bg-white/5 transition-colors"
                         >
                             {isMaximized ? <Minimize2 size={15} /> : <Maximize2 size={15} />}
                         </button>
@@ -874,7 +956,7 @@ const ChatLayout: React.FC<ChatLayoutProps> = ({ children }) => {
                     <Tip text="סגור (איפוס תצוגה)">
                         <button
                             onClick={handleClose}
-                            className="p-1 hover:bg-red-500 rounded"
+                            className="p-1.5 rounded text-stone-400 hover:text-rose-300 hover:bg-rose-500/15 transition-colors"
                         >
                             <X size={15} />
                         </button>
@@ -882,20 +964,20 @@ const ChatLayout: React.FC<ChatLayoutProps> = ({ children }) => {
                 </div>
             </div>
 
-            {/* כפתור קישור קבוע - פורום המשתמשים ב-WhatsApp */}
-            <div className="px-3 pt-3 flex-shrink-0">
+            {/* כפתור קישור קבוע - פורום המשתמשים ב-WhatsApp - מעודן */}
+            <div className="px-4 pt-3 flex-shrink-0">
                 <Tip text="לחץ להצטרפות לקבוצת ה-WhatsApp">
                     <a
                         href={WHATSAPP_GROUP_URL}
                         target="_blank"
                         rel="noopener noreferrer"
-                        className="group inline-flex items-center justify-center gap-2 w-full px-3 py-2 bg-[#25D366] hover:bg-[#1da851] active:bg-[#168a42] text-white text-sm font-semibold rounded-lg shadow-md hover:shadow-lg active:shadow-sm active:translate-y-px transition-all duration-150 ring-1 ring-[#1da851]/30"
+                        className="group inline-flex items-center justify-center gap-2 w-full px-3.5 py-2 bg-[#0f1419] hover:bg-[#1a1f2e] text-stone-100 text-[13px] font-medium rounded-lg shadow-sm transition-all duration-150 ring-1 ring-stone-200/60 hover:ring-stone-300"
                     >
-                        <MessageCircle size={16} strokeWidth={2.5} className="flex-shrink-0" />
-                        <span>הצטרף לפורום המשתמשים</span>
+                        <MessageCircle size={15} strokeWidth={2} className="flex-shrink-0 text-emerald-400" />
+                        <span className="tracking-wide">הצטרף לפורום המשתמשים</span>
                         <ChevronLeft
-                            size={15}
-                            className="opacity-80 group-hover:-translate-x-0.5 transition-transform flex-shrink-0"
+                            size={14}
+                            className="opacity-60 group-hover:-translate-x-0.5 group-hover:opacity-100 transition-all flex-shrink-0 text-stone-400"
                         />
                     </a>
                 </Tip>
@@ -908,48 +990,51 @@ const ChatLayout: React.FC<ChatLayoutProps> = ({ children }) => {
                 className="flex-1 p-4 overflow-y-auto bg-slate-50/30 flex flex-col gap-3"
             >
                 {messages.length === 0 ? (
-                    // ---------- מסך פתיחה ----------
-                    <div className="flex-1 flex flex-col items-center justify-center text-center px-2 py-6 gap-5">
-                        {/* לוגו גדול עם אפקט זוהר */}
+                    // ---------- מסך פתיחה יוקרתי ----------
+                    <div className="flex-1 flex flex-col items-center justify-center text-center px-4 py-8 gap-6">
+                        {/* לוגו גדול - גרדיאנט זהב יוקרתי עם זוהר עדין */}
                         <div className="relative">
-                            <div className="absolute inset-0 bg-gradient-to-br from-blue-500 to-cyan-400 rounded-2xl blur-2xl opacity-40" />
-                            <div className="relative w-20 h-20 bg-gradient-to-br from-blue-500 to-cyan-400 rounded-2xl flex items-center justify-center font-black text-white text-4xl shadow-xl shadow-blue-500/30">
+                            <div className="absolute inset-0 bg-gradient-to-br from-amber-300 to-amber-700 rounded-2xl blur-3xl opacity-20" />
+                            <div className="relative w-24 h-24 bg-gradient-to-br from-amber-300 via-amber-500 to-amber-700 rounded-2xl flex items-center justify-center font-serif font-bold text-[#0f1419] text-5xl shadow-[0_8px_30px_-5px_rgba(245,158,11,0.35)] ring-1 ring-amber-300/50">
                                 Z
                                 <Sparkles
                                     size={14}
-                                    className="absolute top-2 left-2 text-white/80 animate-pulse"
+                                    className="absolute top-2.5 left-2.5 text-white/80 animate-pulse"
                                 />
                             </div>
                         </div>
 
-                        {/* הודעת ברוכים הבאים */}
-                        <div className="space-y-1.5">
-                            <h2 className="text-xl font-bold text-slate-800">
-                                שלום {USER_NAME}, ברוכים הבאים ל־
-                                <span className="text-blue-600">Z</span>
-                                <span className="text-slate-800">chat</span>
+                        {/* הודעת ברוכים הבאים - טיפוגרפיה מסוגננת */}
+                        <div className="space-y-2">
+                            <h2 className="text-[22px] font-light text-stone-800 tracking-tight">
+                                שלום <span className="font-medium text-stone-900">{USER_NAME}</span>,
+                                <br />
+                                <span className="text-stone-600">ברוכים הבאים ל־</span>
+                                <span className="text-amber-600 font-medium">Z</span>
+                                <span className="text-stone-900 font-medium">chat</span>
                             </h2>
-                            <p className="text-sm text-slate-600 leading-relaxed max-w-xs mx-auto">
+                            <div className="w-12 h-px bg-amber-500/40 mx-auto" />
+                            <p className="text-[13px] text-stone-500 leading-relaxed max-w-xs mx-auto font-light">
                                 מערכת מבוססת בינה מלאכותית
                                 <br />
                                 לקבלת מידע מבצעי בזמן אמת
                             </p>
                         </div>
 
-                        {/* הודעת Beta */}
-                        <div className="flex items-start gap-2 bg-amber-50 border border-amber-200 text-amber-900 px-3 py-2 rounded-lg max-w-xs text-right">
-                            <AlertCircle size={16} className="text-amber-600 flex-shrink-0 mt-0.5" />
-                            <p className="text-xs leading-relaxed">
-                                המערכת נמצאת בגרסת <span className="font-bold">Beta</span> וייתכנו
+                        {/* הודעת Beta - מאופקת ומעודנת */}
+                        <div className="flex items-start gap-2.5 bg-amber-50/60 border border-amber-200/60 text-amber-900 px-4 py-2.5 rounded-lg max-w-xs text-right">
+                            <AlertCircle size={15} className="text-amber-600 flex-shrink-0 mt-0.5" strokeWidth={1.5} />
+                            <p className="text-[11px] leading-relaxed font-light">
+                                המערכת נמצאת בגרסת <span className="font-medium">Beta</span> וייתכנו
                                 אי־דיוקים במידע המוצג.
                             </p>
                         </div>
 
-                        {/* רמז למשתמש - גם להתחיל וגם לרמוז על אייקון העזרה */}
-                        <p className="text-xs text-slate-400 mt-2">
+                        {/* רמז למשתמש */}
+                        <p className="text-[11px] text-stone-400 mt-1 font-light tracking-wide">
                             הקלד שאלה למטה כדי להתחיל,
                             <br />
-                            או לחץ על <HelpCircle size={12} className="inline-block align-middle text-slate-500" /> בכותרת לדוגמאות ונושאים
+                            או לחץ על <HelpCircle size={11} className="inline-block align-middle text-stone-500" /> בכותרת לדוגמאות ונושאים
                         </p>
                     </div>
                 ) : (
@@ -964,20 +1049,20 @@ const ChatLayout: React.FC<ChatLayoutProps> = ({ children }) => {
                                 className={
                                     isAgentWorking
                                         ? // מצב "סוכן עובד" - בלי מסגרת, בלי רקע, רק טקסט אפור
-                                        'self-start text-slate-500 text-xs italic px-2'
-                                        : // בועה רגילה - עם רקע, מסגרת, צל
-                                        `p-3 rounded-2xl shadow-sm max-w-[90%] text-sm leading-relaxed ${msg.sender === 'bot'
-                                            ? 'bg-white border border-slate-200 rounded-tr-none self-start text-slate-700'
-                                            : 'bg-blue-600 rounded-tl-none self-end text-white'
+                                        'self-start text-stone-500 text-xs italic px-2 font-light'
+                                        : // בועה מקצועית - מרווחת יותר, ללא מסגרת, צל עמוק
+                                        `px-5 py-3.5 rounded-lg w-fit max-w-[97%] text-[14px] leading-relaxed break-words ${msg.sender === 'bot'
+                                            ? 'bg-white self-start text-stone-800 shadow-[0_2px_8px_rgba(15,20,25,0.06)]'
+                                            : 'bg-[#1a1f2e] self-end text-stone-100 shadow-[0_2px_8px_rgba(15,20,25,0.15)]'
                                         }`
                                 }
                             >
                                 {/* בועת בוט במצב "סוכן עובד" - מציג action מתחלף */}
                                 {isAgentWorking ? (
-                                    <div className="flex items-center gap-2 text-slate-500 py-1">
-                                        {/* ספינר עדין מסתובב */}
-                                        <span className="inline-block w-3 h-3 border-2 border-slate-400 border-t-transparent rounded-full animate-spin flex-shrink-0" />
-                                        <span>{msg.currentAction}</span>
+                                    <div className="flex items-center gap-2 text-stone-500 py-1">
+                                        {/* ספינר עדין מסתובב - גוון זהב */}
+                                        <span className="inline-block w-3 h-3 border-[1.5px] border-amber-500/60 border-t-transparent rounded-full animate-spin flex-shrink-0" />
+                                        <span className="font-light tracking-wide">{msg.currentAction}</span>
                                     </div>
                                 ) : (() => {
                                 // לוגיקת קיטוע: אם visibleChars מוגדר וקטן מהאורך - מקטעים
@@ -989,14 +1074,21 @@ const ChatLayout: React.FC<ChatLayoutProps> = ({ children }) => {
                                     : msg.text;
                                 return (
                                     <div>
-                                        <div className="whitespace-pre-wrap">{displayText}</div>
+                                        {/* בהודעות בוט - מעבדים את הטקסט עם renderMessageText:
+                                            מזהה שמות ישויות מ-msg.entities והופך אותם ל-chips לחיצים.
+                                            בהודעות משתמש - תצוגה פשוטה. */}
+                                        <div className="whitespace-pre-wrap">
+                                            {msg.sender === 'bot'
+                                                ? renderMessageText(displayText, msg.entities)
+                                                : displayText}
+                                        </div>
                                         {hasMore && (
                                             <button
                                                 onClick={() => expandMessage(msg.id)}
-                                                className="mt-2 text-xs font-semibold text-blue-600 hover:text-blue-800 hover:underline transition-colors flex items-center gap-1"
+                                                className="mt-2 text-[12px] font-medium text-amber-700 hover:text-amber-900 transition-colors flex items-center gap-1.5 border-t border-stone-100 pt-2"
                                             >
-                                                ⤵ המשך
-                                                <span className="text-[10px] text-slate-400 font-normal">
+                                                <span className="tracking-wide">⤵ המשך לקרוא</span>
+                                                <span className="text-[10px] text-stone-400 font-light">
                                                     ({msg.text.length - (msg.visibleChars ?? 0)} תווים נוספים)
                                                 </span>
                                             </button>
@@ -1005,9 +1097,12 @@ const ChatLayout: React.FC<ChatLayoutProps> = ({ children }) => {
                                 );
                             })()}
 
-                            {/* תאריך ושעת השליחה - מוצג בכרטיס הודעת המשתמש */}
-                            {msg.sender === 'user' && msg.timestamp && (
-                                <div className="text-[10px] text-white/70 mt-1 text-left font-mono">
+                            {/* תאריך ושעת השליחה - מוצג בכל הודעה (משתמש או בוט) */}
+                            {msg.timestamp && !msg.currentAction && (
+                                <div
+                                    className={`text-[10px] mt-1.5 text-left font-mono tracking-wider ${msg.sender === 'user' ? 'text-stone-300/70' : 'text-stone-400'
+                                        }`}
+                                >
                                     {new Date(msg.timestamp).toLocaleTimeString('he-IL', {
                                         hour: '2-digit',
                                         minute: '2-digit',
@@ -1020,52 +1115,49 @@ const ChatLayout: React.FC<ChatLayoutProps> = ({ children }) => {
                                 </div>
                             )}
 
-                                {/* כפתורי פעולה (Like / Dislike / Copy) - רק על הודעות בוט שכבר יש להן טקסט */}
+                                {/* כפתורי פעולה (Like / Dislike / Copy) - ניתן לשנות משוב בכל עת */}
                                 {msg.sender === 'bot' && msg.text && !msg.currentAction && (
-                                    <div className="flex items-center gap-1 mt-2 pt-2 border-t border-slate-100">
-                                        <Tip text="תשובה טובה">
+                                    <div className="flex items-center gap-0.5 mt-2.5 pt-2 border-t border-stone-100">
+                                        <Tip text={msg.feedbackGiven === 'positive' ? 'סומן כתשובה טובה' : 'תשובה טובה'}>
                                             <button
                                                 onClick={() => handleLike(msg.id)}
-                                                disabled={msg.feedbackGiven !== undefined}
-                                                className={`p-1 rounded transition-colors disabled:cursor-default ${msg.feedbackGiven === 'positive'
-                                                    ? 'text-emerald-600 bg-emerald-50'
-                                                    : 'text-slate-400 hover:text-emerald-600 hover:bg-emerald-50 disabled:opacity-40'
+                                                className={`p-1.5 rounded-md transition-colors ${msg.feedbackGiven === 'positive'
+                                                    ? 'text-emerald-700 bg-emerald-50'
+                                                    : 'text-stone-400 hover:text-emerald-700 hover:bg-emerald-50/70'
                                                     }`}
                                             >
-                                                <ThumbsUp size={14} />
+                                                <ThumbsUp size={14} strokeWidth={1.8} />
                                             </button>
                                         </Tip>
-                                        <Tip text="תשובה לא טובה">
+                                        <Tip text={msg.feedbackGiven === 'negative' ? 'שנה את סיבת המשוב' : 'תשובה לא טובה'}>
                                             <button
                                                 onClick={() => handleDislikeClick(msg.id)}
-                                                disabled={msg.feedbackGiven !== undefined}
-                                                className={`p-1 rounded transition-colors disabled:cursor-default ${msg.feedbackGiven === 'negative'
-                                                    ? 'text-red-600 bg-red-50'
-                                                    : 'text-slate-400 hover:text-red-600 hover:bg-red-50 disabled:opacity-40'
+                                                className={`p-1.5 rounded-md transition-colors ${msg.feedbackGiven === 'negative'
+                                                    ? 'text-rose-700 bg-rose-50'
+                                                    : 'text-stone-400 hover:text-rose-700 hover:bg-rose-50/70'
                                                     }`}
                                             >
-                                                <ThumbsDown size={14} />
+                                                <ThumbsDown size={14} strokeWidth={1.8} />
                                             </button>
                                         </Tip>
-                                        {/* כפתור העתקה - מעתיק את הטקסט המלא של ההודעה ללוח */}
                                         <Tip text={copiedMessageId === msg.id ? 'הועתק!' : 'העתק תשובה'}>
                                             <button
                                                 onClick={() => handleCopyMessage(msg)}
-                                                className={`p-1 rounded transition-colors ${copiedMessageId === msg.id
-                                                    ? 'text-blue-600 bg-blue-50'
-                                                    : 'text-slate-400 hover:text-blue-600 hover:bg-blue-50'
+                                                className={`p-1.5 rounded-md transition-colors ${copiedMessageId === msg.id
+                                                    ? 'text-amber-700 bg-amber-50'
+                                                    : 'text-stone-400 hover:text-amber-700 hover:bg-amber-50/70'
                                                     }`}
                                             >
                                                 {copiedMessageId === msg.id ? (
-                                                    <Check size={14} />
+                                                    <Check size={14} strokeWidth={2.5} />
                                                 ) : (
-                                                    <Copy size={14} />
+                                                    <Copy size={14} strokeWidth={1.8} />
                                                 )}
                                             </button>
                                         </Tip>
                                         {msg.feedbackGiven && (
-                                            <span className="text-[10px] text-slate-400 mr-1">
-                                                תודה על המשוב
+                                            <span className="text-[10px] text-stone-400 mr-1.5 font-light tracking-wide">
+                                                {msg.feedbackGiven === 'positive' ? 'משוב חיובי נשלח' : 'משוב שלילי נשלח'} · ניתן לשנות
                                             </span>
                                         )}
                                     </div>
@@ -1076,37 +1168,54 @@ const ChatLayout: React.FC<ChatLayoutProps> = ({ children }) => {
                 )}
             </div>
 
+            {/* באנר מצב צפייה בהיסטוריה - מוצג רק במצב read-only */}
+            {isReadOnly && (
+                <div className="flex items-center justify-between gap-2 px-4 py-2.5 bg-amber-50/70 border-t border-amber-200/60 text-amber-900 text-xs flex-shrink-0">
+                    <div className="flex items-center gap-2 min-w-0">
+                        <AlertCircle size={14} className="flex-shrink-0" strokeWidth={1.5} />
+                        <span className="truncate font-light tracking-wide">צופה בשיחה היסטורית • לא ניתן לכתוב</span>
+                    </div>
+                    <button
+                        onClick={handleExitHistoryView}
+                        className="px-3 py-1 bg-[#1a1f2e] hover:bg-[#0f1419] text-stone-100 rounded-md text-[11px] font-medium tracking-wide transition-colors flex-shrink-0 ring-1 ring-stone-800/30"
+                    >
+                        חזור לשיחה חדשה
+                    </button>
+                </div>
+            )}
+
             {/* אזור הקלט - שדה טקסט + כפתור שליחה/עצירה לפי מצב */}
-            <div className="p-3 bg-white border-t border-slate-100 flex-shrink-0">
-                <div className="flex gap-2 items-center bg-slate-100 rounded-xl px-2 py-1">
+            <div className="p-3.5 bg-stone-50/40 border-t border-stone-200/60 flex-shrink-0">
+                <div className={`flex gap-2 items-center bg-white rounded-xl px-3 py-1 ring-1 ring-stone-200/80 shadow-[0_1px_3px_rgba(0,0,0,0.03)] focus-within:ring-stone-400 transition-all ${isReadOnly ? 'opacity-50' : ''}`}>
                     <input
                         ref={inputRef}
                         type="text"
                         value={inputText}
                         onChange={(e) => setInputText(e.target.value)}
                         onKeyDown={handleInputKeyDown}
-                        placeholder="כתוב שאלה לקבלת תמונת מצב עדכנית"
-                        className="flex-1 bg-transparent border-none py-2 text-sm outline-none text-slate-800 min-w-0"
+                        placeholder={isReadOnly ? 'צופה בהיסטוריה - לא ניתן לכתוב' : 'כתוב שאלה לקבלת תמונת מצב עדכנית'}
+                        disabled={isReadOnly}
+                        className="flex-1 bg-transparent border-none py-2 text-[14px] outline-none text-stone-800 min-w-0 disabled:cursor-not-allowed placeholder:text-stone-400 placeholder:font-light"
                     />
 
-                    {/* כפתור דינמי: שליחה כשלא מייצר, עצירה כשמייצר - עם Radix Tooltip */}
+                    {/* כפתור דינמי: שליחה כשלא מייצר, עצירה כשמייצר. מנוטרל ב-read-only */}
                     {isGenerating ? (
                         <Tip text="עצור את יצירת התשובה" side="top">
                             <button
                                 onClick={handleStop}
-                                className="bg-red-500 text-white p-2 rounded-lg hover:bg-red-600 flex-shrink-0"
+                                className="bg-rose-700 hover:bg-rose-800 text-white p-2 rounded-lg flex-shrink-0 shadow-sm transition-colors"
                             >
-                                <Square size={14} fill="currentColor" />
+                                <Square size={14} fill="currentColor" strokeWidth={0} />
                             </button>
                         </Tip>
                     ) : (
-                        <Tip text="שלח שאלה" side="top">
+                        <Tip text={isReadOnly ? 'מצב צפייה - לא ניתן לשלוח' : 'שלח שאלה'} side="top">
                             <button
                                 onClick={handleSend}
-                                className="bg-blue-600 text-white p-2 rounded-lg hover:bg-blue-700 flex-shrink-0 disabled:opacity-40 disabled:cursor-not-allowed"
-                                disabled={!inputText.trim()}
+                                className="bg-[#1a1f2e] hover:bg-[#0f1419] text-stone-100 p-2 rounded-lg flex-shrink-0 disabled:opacity-30 disabled:cursor-not-allowed shadow-sm transition-colors"
+                                disabled={!inputText.trim() || isReadOnly}
                             >
-                                <Send size={16} />
+                                <Send size={16} strokeWidth={1.5} />
                             </button>
                         </Tip>
                     )}
@@ -1114,13 +1223,12 @@ const ChatLayout: React.FC<ChatLayoutProps> = ({ children }) => {
             </div>
 
             {/* ---------- סיידבר היסטוריית שיחות (רכיב עצמאי) ---------- */}
-            {/* לבטל את הפיצ'ר? פשוט הסר את 3 השורות הבאות + ה-state isHistoryOpen + הכפתור בכותרת */}
             <HistorySidebar
                 isOpen={isHistoryOpen}
                 onClose={() => setIsHistoryOpen(false)}
                 onConversationClick={(conversation) => {
-                    // לעתיד: טעינת תוכן השיחה לפי session_id (יתווסף עם הראוט השני)
-                    console.log('Selected conversation:', conversation);
+                    // טעינת השיחה ל-read-only mode
+                    handleViewHistoricalConversation(conversation.session_id);
                     setIsHistoryOpen(false);
                 }}
             />
